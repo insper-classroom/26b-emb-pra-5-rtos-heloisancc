@@ -1,5 +1,5 @@
 /*
- * LED blink with FreeRTOS
+ * Ultrassom HC-SR04 com FreeRTOS + OLED + LED RGB (Pico Dock)
  */
 #include <FreeRTOS.h>
 #include <queue.h>
@@ -13,59 +13,42 @@
 #include "pins.h"
 #include "ssd1306.h"
 
-// === Definições para SSD1306 ===
-ssd1306_t disp;
+// === Pinos do ultrassom (confira com o seu circuito / pins.h) ===
+const int ULTRA_TRIG_PIN = 16;
+const int ULTRA_ECHO_PIN = 17;
 
-#define BTN_QUEUE_LEN 8
+// === Recursos do RTOS ===
+QueueHandle_t xQueueTime;
+QueueHandle_t xQueueDistance;
+SemaphoreHandle_t xSemaphoreTrigger;
 
-static QueueHandle_t xBtnQueue = NULL;
-
-// === Função de callback (IRQ) ===
-void btn_callback(uint gpio, uint32_t events) {
-    if (events & GPIO_IRQ_EDGE_RISE) {
-        BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-
-        // Envia o GPIO do botão que gerou a interrupção
-        xQueueSendFromISR(xBtnQueue, &gpio, &xHigherPriorityTaskWoken);
+// === Callback do pino ECHO ===
+void pin_callback(uint gpio, uint32_t events) {
+    if (gpio == ULTRA_ECHO_PIN) {
+        if (events & (GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL)) {
+            uint64_t t = to_us_since_boot(get_absolute_time());
+            BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+            xQueueSendFromISR(xQueueTime, &t, &xHigherPriorityTaskWoken);
+        }
     }
 }
 
-void oled_display_init(void) {
+// === Inicializações ===
+void oled_display_init(ssd1306_t *disp) {
     i2c_init(i2c1, 400000);
     gpio_set_function(2, GPIO_FUNC_I2C);
     gpio_set_function(3, GPIO_FUNC_I2C);
     gpio_pull_up(2);
     gpio_pull_up(3);
 
-    disp.external_vcc = false;
-    ssd1306_init(&disp, 128, 64, 0x3C, i2c1);
-    ssd1306_clear(&disp);
-    ssd1306_show(&disp);
+    disp->external_vcc = false;
+    ssd1306_init(disp, 128, 64, 0x3C, i2c1);
+    ssd1306_clear(disp);
+    ssd1306_show(disp);
 
     gpio_init(SSD1306_PIN_LITE);
     gpio_set_dir(SSD1306_PIN_LITE, GPIO_OUT);
     gpio_put(SSD1306_PIN_LITE, 0);
-}
-
-void btns_init(void) {
-    gpio_init(BTN_PIN_R);
-    gpio_set_dir(BTN_PIN_R, GPIO_IN);
-    gpio_pull_up(BTN_PIN_R);
-    gpio_set_irq_enabled_with_callback(BTN_PIN_R,
-                                       GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-                                       true, &btn_callback);
-
-    gpio_init(BTN_PIN_G);
-    gpio_set_dir(BTN_PIN_G, GPIO_IN);
-    gpio_pull_up(BTN_PIN_G);
-    gpio_set_irq_enabled(BTN_PIN_G, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-                         true);
-
-    gpio_init(BTN_PIN_B);
-    gpio_set_dir(BTN_PIN_B, GPIO_IN);
-    gpio_pull_up(BTN_PIN_B);
-    gpio_set_irq_enabled(BTN_PIN_B, GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
-                         true);
 }
 
 void led_rgb_init(void) {
@@ -82,49 +65,90 @@ void led_rgb_init(void) {
     gpio_put(LED_PIN_B, 1);
 }
 
-static void handle_button(uint gpio) {
-    if (gpio == BTN_PIN_R) {
-        gpio_put(LED_PIN_R, 0);
+// LED RGB da Pico Dock é ativo em 0
+void led_rgb_set(int r, int g, int b) {
+    gpio_put(LED_PIN_R, !r);
+    gpio_put(LED_PIN_G, !g);
+    gpio_put(LED_PIN_B, !b);
+}
 
-        ssd1306_clear(&disp);
-        ssd1306_draw_string(&disp, 8, 24, 2, "RED");
-        ssd1306_show(&disp);
+// === Tasks ===
+void trigger_task(void *p) {
+    gpio_init(ULTRA_TRIG_PIN);
+    gpio_set_dir(ULTRA_TRIG_PIN, GPIO_OUT);
+    gpio_put(ULTRA_TRIG_PIN, 0);
 
-        vTaskDelay(pdMS_TO_TICKS(100));
-        gpio_put(LED_PIN_R, 1);
-    }
-    else if (gpio == BTN_PIN_G) {
-        gpio_put(LED_PIN_G, 0);
+    while (true) {
+        gpio_put(ULTRA_TRIG_PIN, 1);
+        vTaskDelay(pdMS_TO_TICKS(1)); // pulso de trigger (liberado pelo enunciado)
+        gpio_put(ULTRA_TRIG_PIN, 0);
 
-        ssd1306_clear(&disp);
-        ssd1306_draw_string(&disp, 8, 24, 2, "GREEN");
-        ssd1306_show(&disp);
+        xSemaphoreGive(xSemaphoreTrigger);
 
-        vTaskDelay(pdMS_TO_TICKS(100));
-        gpio_put(LED_PIN_G, 1);
-    }
-    else if (gpio == BTN_PIN_B) {
-        gpio_put(LED_PIN_B, 0);
-
-        ssd1306_clear(&disp);
-        ssd1306_draw_string(&disp, 8, 24, 2, "BLUE");
-        ssd1306_show(&disp);
-
-        vTaskDelay(pdMS_TO_TICKS(100));
-        gpio_put(LED_PIN_B, 1);
+        vTaskDelay(pdMS_TO_TICKS(200)); // intervalo entre leituras
     }
 }
 
-void task_1(void *p) {
-    oled_display_init();
-    btns_init();
+void echo_task(void *p) {
+    gpio_init(ULTRA_ECHO_PIN);
+    gpio_set_dir(ULTRA_ECHO_PIN, GPIO_IN);
+    gpio_set_irq_enabled_with_callback(ULTRA_ECHO_PIN,
+                                       GPIO_IRQ_EDGE_RISE | GPIO_IRQ_EDGE_FALL,
+                                       true, &pin_callback);
+
+    uint64_t t_rise = 0;
+    uint64_t t_fall = 0;
+
+    while (true) {
+        if (xQueueReceive(xQueueTime, &t_rise, portMAX_DELAY) == pdTRUE) {
+            // pulso do echo dura no máximo ~38 ms
+            if (xQueueReceive(xQueueTime, &t_fall, pdMS_TO_TICKS(50)) == pdTRUE) {
+                float distance = (float)(t_fall - t_rise) * 0.0343f / 2.0f;
+                xQueueSend(xQueueDistance, &distance, 0);
+            }
+        }
+    }
+}
+
+void oled_task(void *p) {
+    ssd1306_t disp;
+    oled_display_init(&disp);
     led_rgb_init();
 
-    uint gpio_event;
+    float distance = 0;
+    char buf[32];
 
-    while (1) {
-        if (xQueueReceive(xBtnQueue, &gpio_event, pdMS_TO_TICKS(50)) == pdTRUE) {
-            handle_button(gpio_event);
+    while (true) {
+        if (xSemaphoreTake(xSemaphoreTrigger, portMAX_DELAY) == pdTRUE) {
+            ssd1306_clear(&disp);
+
+            if (xQueueReceive(xQueueDistance, &distance, pdMS_TO_TICKS(100)) == pdTRUE) {
+                // leitura OK
+                snprintf(buf, sizeof(buf), "Dist: %.1f cm", distance);
+                ssd1306_draw_string(&disp, 0, 0, 1, buf);
+
+                // barra proporcional (0 a 400 cm -> 0 a 128 px)
+                int bar = (int)(distance * 128.0f / 400.0f);
+                if (bar > 128) {
+                    bar = 128;
+                }
+                if (bar > 0) {
+                    ssd1306_draw_square(&disp, 0, 30, bar, 10);
+                }
+
+                if (distance <= 100.0f) {
+                    led_rgb_set(0, 1, 0); // verde
+                } else {
+                    led_rgb_set(1, 1, 0); // amarelo
+                }
+            } else {
+                // dado não chegou: falha no sensor
+                ssd1306_draw_string(&disp, 0, 0, 2, "FALHA");
+                ssd1306_draw_string(&disp, 0, 24, 1, "Sensor sem resposta");
+                led_rgb_set(1, 0, 0); // vermelho
+            }
+
+            ssd1306_show(&disp);
         }
     }
 }
@@ -132,14 +156,13 @@ void task_1(void *p) {
 int main() {
     stdio_init_all();
 
-    xBtnQueue = xQueueCreate(BTN_QUEUE_LEN, sizeof(uint));
-    if (xBtnQueue == NULL) {
-        while (1) {
-            // falha ao criar fila
-        }
-    }
+    xQueueTime = xQueueCreate(32, sizeof(uint64_t));
+    xQueueDistance = xQueueCreate(32, sizeof(float));
+    xSemaphoreTrigger = xSemaphoreCreateBinary();
 
-    xTaskCreate(task_1, "Task 1", 4095, NULL, 1, NULL);
+    xTaskCreate(trigger_task, "Trigger", 256, NULL, 1, NULL);
+    xTaskCreate(echo_task, "Echo", 256, NULL, 1, NULL);
+    xTaskCreate(oled_task, "OLED", 4095, NULL, 1, NULL);
 
     vTaskStartScheduler();
 
